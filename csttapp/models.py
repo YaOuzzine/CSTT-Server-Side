@@ -28,6 +28,14 @@ class Team(models.Model):
             models.Index(fields=['name', 'is_active']),  # Common query pattern
             models.Index(fields=['created_at', 'is_active']),  # For timeline views
         ]
+    
+class TeamInvite(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    team = models.ForeignKey("Team", on_delete=models.CASCADE, related_name="invites")
+    token = models.CharField(max_length=64, unique=True)  # Secure token
+    created_by = models.ForeignKey("Profile", on_delete=models.SET_NULL, null=True)
+    expires_at = models.DateTimeField()  # Expiry for the invite
+    is_active = models.BooleanField(default=True)
 
 class TeamMember(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -85,6 +93,8 @@ class TestCase(models.Model):
     updated_at = models.DateTimeField(auto_now=True, db_index=True)
     is_active = models.BooleanField(default=True)
     metadata = models.JSONField(default=dict)
+    generation_query = models.TextField(null=True, blank=True)  # Store the query content
+    input_image = models.ImageField(upload_to="test_cases/images/", null=True, blank=True)  # Optional image upload
 
     class Meta:
         indexes = [

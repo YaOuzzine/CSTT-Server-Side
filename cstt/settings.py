@@ -44,7 +44,6 @@ INSTALLED_APPS = [
     'csttapp',
     'rest_framework',
     'rest_framework_simplejwt',
-    'authentication',
 ]
 
 MIDDLEWARE = [
@@ -62,6 +61,12 @@ CORS_ALLOWED_ORIGINS = [
     'http://localhost:3000',
     'http://127.0.0.1:3000',
 ]
+
+CSRF_TRUSTED_ORIGINS = [
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+]
+
 
 ROOT_URLCONF = 'cstt.urls'
 
@@ -125,6 +130,11 @@ AUTH_PASSWORD_VALIDATORS = [
 
 load_dotenv()
 
+try:
+    from .dev_settings import DEV_JWT_SECRET_KEY
+except ImportError:
+    DEV_JWT_SECRET_KEY = None
+    
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
@@ -133,7 +143,7 @@ SIMPLE_JWT = {
     'UPDATE_LAST_LOGIN': False,
 
     'ALGORITHM': 'HS256',
-    'SIGNING_KEY': os.getenv('JWT_SECRET_KEY', 'fallback-key-for-development'),  # Replace with your actual secret key
+    'SIGNING_KEY': os.getenv('JWT_SECRET_KEY', DEV_JWT_SECRET_KEY),  # Replace with your actual secret key
     'VERIFYING_KEY': None,
     'AUDIENCE': None,
     'ISSUER': None,
@@ -153,6 +163,14 @@ SIMPLE_JWT = {
     'JTI_CLAIM': 'jti',
 }
 
+if SIMPLE_JWT['SIGNING_KEY'] == DEV_JWT_SECRET_KEY:
+    import warnings
+    warnings.warn(
+        "\nUsing development JWT secret key! This is insecure and should never "
+        "be used in production.\nSet the JWT_SECRET_KEY environment variable "
+        "for proper security.",
+        RuntimeWarning
+    )
 
 # Internationalization
 # https://docs.djangoproject.com/en/4.2/topics/i18n/
