@@ -98,8 +98,9 @@ class TestCaseSerializer(serializers.ModelSerializer):
     class Meta:
         model = TestCase
         fields = ['id', 'title', 'description', 'priority', 'type', 
-                  'status', 'suite', 'metadata', 'steps', "is_active", "generation_query", "input_image"]
-
+                  'status', 'suite', 'metadata', 'steps', "is_active", "generation_query", "input_image", "created_at", "updated_at", "created_by_profile"]
+        read_only_fields = ['id']
+        
     def create(self, validated_data):
         steps_data = validated_data.pop('steps', [])
         test_case = TestCase.objects.create(**validated_data)
