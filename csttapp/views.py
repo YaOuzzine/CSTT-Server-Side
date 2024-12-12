@@ -1,6 +1,9 @@
 import os
 import json
 from openai import OpenAI
+from django.db.models import Count, Avg, F, Q
+from django.utils import timezone
+from datetime import timedelta
 from django.shortcuts import render
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -9,14 +12,15 @@ from django.utils.timezone import now, timedelta
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
 from django.shortcuts import get_object_or_404
-from .models import Team, TeamInvite, TeamMember, Profile, Project, TestSuite, TestCase, TestStep, TestData
-from rest_framework import status, viewsets
+from django.db.models import Q
+from .models import Team, TeamInvite, TeamMember, Profile, Project, TestSuite, TestCase, TestStep, TestData, Defect, AnalyticsService, TestExecution
+from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny
 from rest_framework_simplejwt.tokens import RefreshToken
-from .serializers import UserRegistrationSerializer, UserLoginSerializer, TestCaseSerializer, TestStepBatchSerializer, TeamSerializer, ProjectSerializer, TestSuiteSerializer, TestStepSerializer
+from .serializers import UserRegistrationSerializer, UserLoginSerializer, TestCaseSerializer, TestStepBatchSerializer, TeamSerializer, ProjectSerializer, TestSuiteSerializer, TestStepSerializer, DefectSerializer, DefectDetailSerializer
 
 
 class RegisterView(APIView):
@@ -1050,3 +1054,575 @@ class TestDataListView(APIView):
                 {'error': str(e)}, 
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+class CreateDefectView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, team_id, project_id):
+        try:
+            project = get_object_or_404(Project, id=project_id, team_id=team_id)
+            
+            # Prepare the defect data
+            defect_data = {
+                **request.data,
+                'project': project.id,
+                'status': 'Open',  # Default status for new defects
+                'is_active': True
+            }
+            
+            serializer = DefectSerializer(data=defect_data)
+            if serializer.is_valid():
+                # Save with the reporting user
+                defect = serializer.save(
+                    reported_by_profile=request.user.profile,
+                    # Optionally assign to someone
+                    assigned_to_profile=None  
+                )
+                
+                return Response(
+                    DefectSerializer(defect).data,
+                    status=status.HTTP_201_CREATED
+                )
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+class DefectsListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, team_id, project_id):
+        try:
+            # Get query parameters
+            view = request.query_params.get('view', 'all')
+            priority = request.query_params.get('priority')
+            search = request.query_params.get('search')
+            
+            # Get defects for this project
+            defects = Defect.objects.filter(
+                project_id=project_id,
+                project__team_id=team_id,
+                is_active=True
+            )
+            
+            # Apply filters based on query params
+            if priority and priority != 'all':
+                defects = defects.filter(priority=priority)
+                
+            if search:
+                defects = defects.filter(
+                    Q(title__icontains=search) |
+                    Q(description__icontains=search)
+                )
+                
+            if view == 'my':
+                defects = defects.filter(
+                    Q(assigned_to_profile=request.user.profile) |
+                    Q(reported_by_profile=request.user.profile)
+                )
+            
+            # Order by most recently created
+            defects = defects.order_by('-created_at')
+            
+            serializer = DefectSerializer(defects, many=True)
+            return Response(serializer.data)
+            
+        except Exception as e:
+            print(f"Error in DefectsListView: {str(e)}")  # For debugging
+            return Response(
+                {'error': str(e)}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+class DefectDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, team_id, project_id, defect_id):
+        try:
+            defect = get_object_or_404(
+                Defect, 
+                id=defect_id,
+                project_id=project_id,
+                project__team_id=team_id,
+                is_active=True
+            )
+            
+            # Get team members for assignment options
+            team_members = TeamMember.objects.filter(
+                team_id=team_id,
+                is_active=True
+            ).select_related('profile__auth_user')
+
+            serializer = DefectDetailSerializer(defect)
+            
+            # Add team members to response for assignment dropdown
+            response_data = {
+                **serializer.data,
+                'team_members': [
+                    {
+                        'id': tm.profile.id,
+                        'name': tm.profile.auth_user.get_full_name(),
+                        'email': tm.profile.auth_user.email
+                    }
+                    for tm in team_members
+                ]
+            }
+            
+            return Response(response_data)
+            
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    def patch(self, request, team_id, project_id, defect_id):
+        try:
+            defect = get_object_or_404(
+                Defect, 
+                id=defect_id,
+                project_id=project_id,
+                project__team_id=team_id,
+                is_active=True
+            )
+            
+            # Update the defect
+            serializer = DefectDetailSerializer(
+                defect,
+                data=request.data,
+                partial=True
+            )
+            
+            if serializer.is_valid():
+                # Handle metadata updates (tags, affected area)
+                metadata = defect.metadata or {}
+                if 'tags' in request.data:
+                    metadata['tags'] = request.data['tags']
+                if 'affected_area' in request.data:
+                    metadata['affected_area'] = request.data['affected_area']
+                
+                # Save with metadata and return updated defect
+                defect = serializer.save(metadata=metadata)
+                
+                # Create history entry
+                DefectHistory.objects.create(
+                    defect=defect,
+                    changed_by_profile=request.user.profile,
+                    field_name='Updated defect',
+                    old_value='',
+                    new_value=f"Updated by {request.user.get_full_name()}"
+                )
+                
+                return Response(serializer.data)
+                
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+class DefectDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, team_id, project_id, defect_id):
+        try:
+            # Get the defect
+            defect = get_object_or_404(
+                Defect,
+                id=defect_id,
+                project_id=project_id,
+                project__team_id=team_id,
+                is_active=True
+            )
+            
+            # Get team members for the assignment dropdown
+            team_members = TeamMember.objects.filter(
+                team_id=team_id,
+                is_active=True
+            ).select_related('profile__auth_user')
+            
+            # Serialize defect data
+            serializer = DefectDetailSerializer(defect)
+            
+            # Add team members to response
+            response_data = {
+                **serializer.data,
+                'team_members': [
+                    {
+                        'id': str(tm.profile.id),
+                        'name': tm.profile.auth_user.get_full_name() or tm.profile.auth_user.email,
+                        'email': tm.profile.auth_user.email
+                    }
+                    for tm in team_members
+                ]
+            }
+            
+            return Response(response_data)
+        
+        except Exception as e:
+            print(f"Error in DefectDetailView GET: {str(e)}")  # For debugging
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    def patch(self, request, team_id, project_id, defect_id):
+        try:
+            defect = get_object_or_404(
+                Defect,
+                id=defect_id,
+                project_id=project_id,
+                project__team_id=team_id,
+                is_active=True
+            )
+            
+            # Get data from request
+            data = request.data.copy()
+            
+            # Handle assignee update
+            if 'assignee_id' in data:
+                assignee_id = data.pop('assignee_id')
+                if assignee_id:
+                    try:
+                        profile = Profile.objects.get(id=assignee_id)
+                        data['assigned_to_profile'] = profile
+                    except Profile.DoesNotExist:
+                        return Response(
+                            {'error': 'Invalid assignee ID'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                else:
+                    data['assigned_to_profile'] = None
+            
+            # Handle metadata updates (tags, affected area)
+            metadata = defect.metadata or {}
+            if 'tags' in data:
+                metadata['tags'] = data['tags']
+            if 'affected_area' in data:
+                metadata['affected_area'] = data['affected_area']
+            data['metadata'] = metadata
+            
+            # Update defect
+            serializer = DefectDetailSerializer(
+                defect,
+                data=data,
+                partial=True
+            )
+            
+            if serializer.is_valid():
+                updated_defect = serializer.save()
+                
+                # Return updated defect with team members
+                team_members = TeamMember.objects.filter(
+                    team_id=team_id,
+                    is_active=True
+                ).select_related('profile__auth_user')
+                
+                response_data = {
+                    **serializer.data,
+                    'team_members': [
+                        {
+                            'id': str(tm.profile.id),
+                            'name': tm.profile.auth_user.get_full_name() or tm.profile.auth_user.email,
+                            'email': tm.profile.auth_user.email
+                        }
+                        for tm in team_members
+                    ]
+                }
+                
+                return Response(response_data)
+            
+            return Response(
+                serializer.errors,
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        except Exception as e:
+            print(f"Error in DefectDetailView PATCH: {str(e)}")  # For debugging
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+class ProjectAnalyticsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id):
+        """
+        Comprehensive analytics endpoint for a project
+        """
+        try:
+            # Verify project exists and user has access
+            project = Project.objects.get(id=project_id)
+            
+            # Fetch various analytics
+            test_execution_metrics = AnalyticsService.get_test_execution_metrics(project_id)
+            defect_metrics = AnalyticsService.get_defect_metrics(project_id)
+            test_execution_trend = AnalyticsService.get_test_execution_trend(project_id)
+            
+            return Response({
+                'test_execution': test_execution_metrics,
+                'defects': defect_metrics,
+                'test_execution_trend': test_execution_trend
+            }, status=status.HTTP_200_OK)
+        
+        except Project.DoesNotExist:
+            return Response({
+                'error': 'Project not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        except Exception as e:
+            print(f"Unexpected error in project analytics: {e}")
+            return Response({
+                'error': 'Failed to retrieve analytics',
+                'details': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+class ProjectDashboardView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get_ai_suggestions(self, project_metrics):
+        """
+        Generate AI-powered smart suggestions based on project metrics
+        """
+        try:
+            client = OpenAI()
+
+            # Prepare project metrics for AI analysis
+            metrics_summary = f"""
+            Project Metrics Summary:
+            - Total Test Cases: {project_metrics['test_execution']['total_test_cases']}
+            - Total Test Executions: {project_metrics['test_execution']['total_executions']}
+            - Passed Executions: {project_metrics['test_execution']['passed_executions']} ({project_metrics['test_execution']['test_coverage']}%)
+            - Active Defects: {project_metrics['defects']['open_defects']} 
+            - High Priority Defects: {sum(item['count'] for item in project_metrics['defects']['defect_distribution'] if item['severity'] in ['High', 'Critical'])}
+            """
+
+            # Define AI suggestion generation function
+            functions = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "generate_project_suggestions",
+                        "description": "Generate smart suggestions for improving project testing and quality",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "primary_suggestion": {
+                                    "type": "string",
+                                    "description": "The most critical recommendation for the project"
+                                },
+                                "secondary_suggestions": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string",
+                                        "description": "Additional recommendations to improve project quality"
+                                    }
+                                }
+                            },
+                            "required": ["primary_suggestion", "secondary_suggestions"]
+                        }
+                    }
+                }
+            ]
+
+            # Prepare messages for AI
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are an expert software testing consultant. Analyze the following project metrics and provide actionable, strategic suggestions to improve testing efficiency and software quality."
+                },
+                {
+                    "role": "user",
+                    "content": f"""
+                    Please review the following project metrics and provide strategic recommendations:
+
+                    {metrics_summary}
+
+                    Based on these metrics, generate:
+                    1. A primary, most critical suggestion for immediate improvement
+                    2. 2-3 additional recommendations to enhance testing and quality
+                    
+                    Focus on practical, implementable strategies that can help the team improve their testing process, reduce defects, and increase test coverage.
+                    """
+                }
+            ]
+
+            # Generate AI suggestions
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                tools=functions,
+                tool_choice={"type": "function", "function": {"name": "generate_project_suggestions"}}
+            )
+
+            # Extract the function call and arguments
+            assistant_message = response.choices[0].message
+            
+            if assistant_message.tool_calls:
+                tool_call = assistant_message.tool_calls[0]
+                
+                try:
+                    suggestions = json.loads(tool_call.function.arguments)
+                    return suggestions
+                except Exception as json_error:
+                    print("JSON parsing error:", str(json_error))
+                    return {
+                        "primary_suggestion": "Review and optimize your current testing processes",
+                        "secondary_suggestions": [
+                            "Increase test automation coverage",
+                            "Implement more rigorous defect tracking"
+                        ]
+                    }
+            else:
+                return {
+                    "primary_suggestion": "Review and optimize your current testing processes",
+                    "secondary_suggestions": [
+                        "Increase test automation coverage",
+                        "Implement more rigorous defect tracking"
+                    ]
+                }
+
+        except Exception as e:
+            print(f"AI Suggestion Generation Error: {e}")
+            return {
+                "primary_suggestion": "Review and optimize your current testing processes",
+                "secondary_suggestions": [
+                    "Increase test automation coverage",
+                    "Implement more rigorous defect tracking"
+                ]
+            }
+
+    def get(self, request, project_id):
+        """
+        Comprehensive dashboard metrics for a specific project
+        """
+        try:
+            # Fetch project details
+            project = Project.objects.get(id=project_id)
+            
+            # Calculate test case metrics
+            test_cases = TestCase.objects.filter(suite__project=project)
+            total_test_cases = test_cases.count()
+            
+            # Calculate test execution metrics for the last 7 days
+            seven_days_ago = timezone.now() - timedelta(days=7)
+            test_executions = TestExecution.objects.filter(
+                test_case__suite__project=project,
+                started_at__gte=seven_days_ago
+            )
+            
+            # Passed tests calculation
+            total_test_executions = test_executions.count()
+            passed_test_executions = test_executions.filter(status='Passed').count()
+            passed_percentage = (passed_test_executions / total_test_executions * 100) if total_test_executions > 0 else 0
+            
+            # Defect metrics
+            defects = Defect.objects.filter(project=project)
+            active_defects = defects.filter(status__in=['Open', 'In Progress']).count()
+            high_priority_defects = defects.filter(
+                status__in=['Open', 'In Progress'], 
+                priority='High'
+            ).count()
+            
+            # Test coverage calculation
+            test_coverage = (passed_test_executions / total_test_cases * 100) if total_test_cases > 0 else 0
+            
+            # Prepare metrics dictionary for AI suggestion generation
+            project_metrics = {
+                'test_execution': {
+                    'total_test_cases': total_test_cases,
+                    'total_executions': total_test_executions,
+                    'passed_executions': passed_test_executions,
+                    'test_coverage': round(test_coverage, 2)
+                },
+                'defects': {
+                    'open_defects': active_defects,
+                    'defect_distribution': [
+                        {'severity': d['severity'], 'count': d['count']} 
+                        for d in defects.values('severity').annotate(count=Count('id'))
+                    ]
+                }
+            }
+            
+            # Generate AI suggestions
+            ai_suggestions = self.get_ai_suggestions(project_metrics)
+            
+            # Prepare dashboard metrics
+            dashboard_metrics = [
+                {
+                    'id': 'test-cases',
+                    'title': 'Total Test Cases',
+                    'value': str(total_test_cases),
+                    'change': f'+{test_cases.filter(created_at__gte=seven_days_ago).count()} this week',
+                },
+                {
+                    'id': 'defects',
+                    'title': 'Active Defects',
+                    'value': str(active_defects),
+                    'change': f'{high_priority_defects} high priority',
+                },
+                {
+                    'id': 'passed',
+                    'title': 'Tests Passed',
+                    'value': f'{passed_percentage:.1f}%',
+                    'change': f'+{passed_percentage:.1f}% from last run',
+                },
+                {
+                    'id': 'coverage',
+                    'title': 'Test Coverage',
+                    'value': f'{test_coverage:.1f}%',
+                    'change': f'+{test_coverage:.1f}% this sprint',
+                }
+            ]
+            
+            return Response({
+                'project': {
+                    'id': str(project.id),
+                    'name': project.name,
+                    'description': project.description,
+                    'status': project.status,
+                    'created_at': project.created_at
+                },
+                'metrics': dashboard_metrics,
+                'quick_actions': [
+                    {
+                        'id': 'create-test',
+                        'title': 'Create Test Case',
+                        'href': 'test-suites',
+                    },
+                    {
+                        'id': 'report-defect',
+                        'title': 'Report Defect',
+                        'href': 'defects/create',
+                    },
+                    {
+                        'id': 'schedule-run',
+                        'title': 'Schedule Test Run',
+                        'href': 'test-runs/schedule',
+                    },
+                    {
+                        'id': 'team',
+                        'title': 'Manage Team',
+                        'href': 'team',
+                    }
+                ],
+                'ai_suggestions': ai_suggestions
+            }, status=status.HTTP_200_OK)
+        
+        except Project.DoesNotExist:
+            return Response({
+                'error': 'Project not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        except Exception as e:
+            print(f"Error in project dashboard: {e}")
+            return Response({
+                'error': 'Failed to retrieve project dashboard',
+                'details': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

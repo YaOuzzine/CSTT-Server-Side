@@ -1,6 +1,10 @@
 from django.db import models
 from django.contrib.auth.models import User
 import uuid
+from django.db.models import Count, Avg, F
+from django.db.models.functions import TruncDate
+from django.utils import timezone
+from datetime import timedelta
 
 class Profile(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -263,3 +267,151 @@ class AnalyticsMetric(models.Model):
             models.Index(fields=['analytics', 'created_at']),
             models.Index(fields=['metric_name', 'metric_value'])
         ]
+
+class AnalyticsService:
+    @classmethod
+    def get_test_execution_metrics(cls, project_id):
+        """
+        Calculate test execution metrics for a given project
+        """
+        try:
+            # Total test cases
+            total_test_cases = TestCase.objects.filter(suite__project_id=project_id).count()
+            
+            # Test executions in the last 30 days
+            thirty_days_ago = timezone.now() - timedelta(days=30)
+            test_executions = TestExecution.objects.filter(
+                test_case__suite__project_id=project_id, 
+                started_at__gte=thirty_days_ago
+            )
+            
+            # Calculate metrics
+            total_executions = test_executions.count()
+            passed_executions = test_executions.filter(status='Passed').count()
+            failed_executions = test_executions.filter(status='Failed').count()
+            skipped_executions = test_executions.filter(status='Skipped').count()
+            
+            # Test coverage calculation
+            test_coverage = (passed_executions / total_test_cases * 100) if total_test_cases > 0 else 0
+            
+            return {
+                'total_test_cases': total_test_cases,
+                'total_executions': total_executions,
+                'passed_executions': passed_executions,
+                'failed_executions': failed_executions,
+                'skipped_executions': skipped_executions,
+                'test_coverage': round(test_coverage, 2)
+            }
+        except Exception as e:
+            print(f"Error in test execution metrics: {e}")
+            return {
+                'total_test_cases': 0,
+                'total_executions': 0,
+                'passed_executions': 0,
+                'failed_executions': 0,
+                'skipped_executions': 0,
+                'test_coverage': 0
+            }
+    
+    @classmethod
+    def get_defect_metrics(cls, project_id):
+        """
+        Calculate defect metrics for a given project
+        """
+        try:
+            defects = Defect.objects.filter(project_id=project_id)
+            
+            # Defect count by severity with safe defaults
+            defect_distribution = list(defects.values('severity').annotate(
+                count=Count('id')
+            ))
+            
+            # Ensure all severity levels are represented
+            severity_levels = ['Critical', 'High', 'Medium', 'Low']
+            distribution_dict = {item['severity']: item['count'] for item in defect_distribution}
+            full_distribution = [
+                {'severity': level, 'count': distribution_dict.get(level, 0)}
+                for level in severity_levels
+            ]
+            
+            # Defect resolution metrics
+            total_defects = defects.count()
+            open_defects = defects.filter(status__in=['Open', 'In Progress']).count()
+            closed_defects = defects.filter(status='Closed').count()
+            
+            # Average time to resolve defects
+            resolved_defects = defects.filter(status='Closed')
+            avg_resolution = resolved_defects.aggregate(
+                avg_time=Avg(F('updated_at') - F('created_at'))
+            )
+            avg_resolution_time = str(avg_resolution['avg_time']) if avg_resolution['avg_time'] else 'N/A'
+            
+            return {
+                'total_defects': total_defects,
+                'open_defects': open_defects,
+                'closed_defects': closed_defects,
+                'defect_distribution': full_distribution,
+                'avg_resolution_time': avg_resolution_time
+            }
+        except Exception as e:
+            print(f"Error in defect metrics: {e}")
+            return {
+                'total_defects': 0,
+                'open_defects': 0,
+                'closed_defects': 0,
+                'defect_distribution': [
+                    {'severity': 'Critical', 'count': 0},
+                    {'severity': 'High', 'count': 0},
+                    {'severity': 'Medium', 'count': 0},
+                    {'severity': 'Low', 'count': 0}
+                ],
+                'avg_resolution_time': 'N/A'
+            }
+    
+    @classmethod
+    def get_test_execution_trend(cls, project_id):
+        """
+        Get daily test execution trend for the last 14 days
+        """
+        try:
+            fourteen_days_ago = timezone.now() - timedelta(days=14)
+            
+            # Generate a full 14-day trend with zero values if no executions
+            base_dates = [fourteen_days_ago + timedelta(days=x) for x in range(14)]
+            
+            # Get actual execution data
+            execution_trend = TestExecution.objects.filter(
+                test_case__suite__project_id=project_id,
+                started_at__gte=fourteen_days_ago
+            ).annotate(
+                date=TruncDate('started_at')
+            ).values('date').annotate(
+                passed=Count('id', filter=Q(status='Passed')),
+                failed=Count('id', filter=Q(status='Failed')),
+                skipped=Count('id', filter=Q(status='Skipped'))
+            ).order_by('date')
+            
+            # Convert to list and create a complete 14-day trend
+            trend_dict = {
+                item['date'].strftime('%Y-%m-%d'): {
+                    'passed': item['passed'],
+                    'failed': item['failed'],
+                    'skipped': item['skipped']
+                } 
+                for item in execution_trend
+            }
+            
+            full_trend = [
+                {
+                    'date': date.strftime('%Y-%m-%d'),
+                    'passed': trend_dict.get(date.strftime('%Y-%m-%d'), {}).get('passed', 0),
+                    'failed': trend_dict.get(date.strftime('%Y-%m-%d'), {}).get('failed', 0),
+                    'skipped': trend_dict.get(date.strftime('%Y-%m-%d'), {}).get('skipped', 0)
+                }
+                for date in base_dates
+            ]
+            
+            return full_trend
+        except Exception as e:
+            print(f"Error in test execution trend: {e}")
+            return []

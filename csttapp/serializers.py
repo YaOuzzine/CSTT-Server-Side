@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
-from .models import Profile, TestCase, TestSuite, TestCase, TestStep, Team, Project
+from .models import Profile, TestCase, TestSuite, TestCase, TestStep, Team, Project, Defect
 
 class UserRegistrationSerializer(serializers.ModelSerializer):
     full_name = serializers.CharField(required=True)
@@ -141,4 +141,84 @@ class TestStepBatchSerializer(serializers.Serializer):
         steps = [TestStep(**step_data) for step_data in steps_data]
         created_steps = TestStep.objects.bulk_create(steps)
         return {'steps': created_steps}
+    
+class DefectSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Defect
+        fields = [
+            'id', 'title', 'description', 'status', 'priority', 
+            'severity', 'project', 'assigned_to_profile', 
+            'reported_by_profile', 'created_at', 'updated_at',
+            'metadata', 'is_active'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at', 'reported_by_profile']
 
+    def create(self, validated_data):
+        # Store any tags or additional metadata
+        metadata = validated_data.pop('metadata', {})
+        if 'affected_area' in self.initial_data:
+            metadata['affected_area'] = self.initial_data['affected_area']
+        if 'tags' in self.initial_data:
+            metadata['tags'] = [tag.strip() for tag in self.initial_data['tags'].split(',')]
+        if 'steps_to_reproduce' in self.initial_data:
+            metadata['steps_to_reproduce'] = self.initial_data['steps_to_reproduce']
+            
+        validated_data['metadata'] = metadata
+        return super().create(validated_data)
+
+class DefectDetailSerializer(serializers.ModelSerializer):
+    reporter = serializers.SerializerMethodField()
+    assignee = serializers.SerializerMethodField()
+    tags = serializers.SerializerMethodField()
+    affected_area = serializers.SerializerMethodField()
+    reporter_id = serializers.SerializerMethodField()
+    assignee_id = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Defect
+        fields = [
+            'id', 'title', 'description', 'status', 'priority', 
+            'severity', 'created_at', 'updated_at', 'reporter',
+            'assignee', 'tags', 'affected_area', 'reporter_id',
+            'assignee_id', 'metadata'
+        ]
+        
+    def get_reporter(self, obj):
+        if obj.reported_by_profile:
+            return f"{obj.reported_by_profile.auth_user.get_full_name()}"
+        return "Unknown"
+        
+    def get_assignee(self, obj):
+        if obj.assigned_to_profile:
+            return f"{obj.assigned_to_profile.auth_user.get_full_name()}"
+        return "Unassigned"
+        
+    def get_reporter_id(self, obj):
+        return str(obj.reported_by_profile.id) if obj.reported_by_profile else None
+        
+    def get_assignee_id(self, obj):
+        return str(obj.assigned_to_profile.id) if obj.assigned_to_profile else None
+        
+    def get_tags(self, obj):
+        return obj.metadata.get('tags', []) if obj.metadata else []
+        
+    def get_affected_area(self, obj):
+        return obj.metadata.get('affected_area', '') if obj.metadata else ''
+
+    def update(self, instance, validated_data):
+        # Handle assignment
+        if 'assigned_to_profile_id' in validated_data:
+            profile_id = validated_data.pop('assigned_to_profile_id')
+            if profile_id:
+                try:
+                    profile = Profile.objects.get(id=profile_id)
+                    instance.assigned_to_profile = profile
+                except Profile.DoesNotExist:
+                    pass
+        
+        # Update other fields
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        
+        instance.save()
+        return instance

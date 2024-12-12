@@ -32,4 +32,11 @@ urlpatterns = [
     path('test-data/generate/', views.GenerateTestDataView.as_view(), name='generate_test_data'),
     path('test-data/save/', views.SaveTestDataView.as_view(), name='save_test_data'),
     path('test-data/', views.TestDataListView.as_view(), name='test_data_list'),
+    path('teams/<uuid:team_id>/projects/<uuid:project_id>/defects/create/', views.CreateDefectView.as_view(), name='create_defect'),
+    path('teams/<uuid:team_id>/projects/<uuid:project_id>/defects/', views.DefectsListView.as_view(), name='defects_list'),
+    path('teams/<uuid:team_id>/projects/<uuid:project_id>/defects/<uuid:defect_id>/', views.DefectDetailView.as_view(), name='defect_detail'),
+    path('teams/<uuid:team_id>/projects/<uuid:project_id>/defects/<uuid:defect_id>/update/', views.DefectDetailView.as_view(),
+    name='defect_update'),
+    path('projects/<uuid:project_id>/analytics/', views.ProjectAnalyticsView.as_view(), name='project_analytics'),
+    path('projects/<uuid:project_id>/dashboard/', views.ProjectDashboardView.as_view(), name='project_dashboard'),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
